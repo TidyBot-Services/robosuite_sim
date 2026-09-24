@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tidybot-robosuite-sim"
+version = "1.0.0"
+description = "Independent TidyBot Robosuite simulation service and HTTP client"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+  "numpy==1.26.4",
+  "mujoco==3.3.0",
+  "robosuite==1.5.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["robosuite_sim*"]
