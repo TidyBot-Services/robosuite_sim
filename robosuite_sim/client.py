@@ -46,6 +46,19 @@ class RobosuiteSimClient:
         response = self._request("POST", "/v1/reset", request)
         return self._decode_session(response)
 
+    def reset_attested(self, **request: Any) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, dict[str, Any], dict[str, str]]:
+        response = self._request("POST", "/v1/reset", request)
+        applied = response.get("applied_variation")
+        if not isinstance(applied, dict) or set(applied) != {"scene_id", "object_set_id"}:
+            raise ServiceError("reset did not attest the realized variation")
+        return (*self._decode_session(response), applied)
+
+    def perceive_gt(self, *, target_names: list[str] | None = None, camera_names: list[str] | None = None) -> dict[str, Any]:
+        return self._request(
+            "POST", "/v2/perceive_gt",
+            {"target_names": target_names, "camera_names": camera_names},
+        )
+
     def attach(self) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, dict[str, Any]]:
         """Attach to an already-reset episode without changing its state."""
         return self._decode_session(self._request("GET", "/v1/session"))

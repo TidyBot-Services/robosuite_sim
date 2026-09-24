@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -145,6 +147,36 @@ class RobosuiteBackend:
 
     def native_success(self) -> bool:
         return bool(self._env._check_success())
+
+    def gt_objects(self) -> list[dict[str, Any]]:
+        """Evaluator-side object positions for the separate v2 sim_gt track."""
+        if self._last_raw is None:
+            raise RuntimeError("reset must be called before GT perception")
+        objects = []
+        for key in self.spec.object_keys:
+            position = np.asarray(self._last_raw[key], dtype=np.float64).reshape(-1)
+            if position.shape != (3,) or not np.isfinite(position).all():
+                raise ValueError(f"invalid task object position: {key}")
+            objects.append({"name": key.removesuffix("_pos"), "position": position.tolist()})
+        return objects
+
+    def variation_identity(self) -> dict[str, str]:
+        """Identify the realized reset, not merely the requested seed."""
+        if self._last_raw is None:
+            raise RuntimeError("reset must be called before variation attestation")
+        objects = [
+            [item["name"], *[round(value, 4) for value in item["position"]]]
+            for item in self.gt_objects()
+        ]
+        eef = np.asarray(self._last_raw["robot0_eef_pos"], dtype=np.float64).reshape(-1)
+        if eef.shape != (3,) or not np.isfinite(eef).all():
+            raise ValueError("invalid robot start position")
+        def digest(value: Any) -> str:
+            return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:20]
+        return {
+            "scene_id": "scene:" + digest({"objects": objects, "robot_start": [round(float(x), 4) for x in eef]}),
+            "object_set_id": "objects:" + digest(objects),
+        }
 
     def run_reference(self, timeout_seconds: float) -> dict[str, np.ndarray]:
         from .reference_policy import run_reference_policy
