@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import json
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -65,6 +67,30 @@ def test_public_filter_removes_object_oracle() -> None:
         }
     )
     assert set(public) == {"agentview_image", "robot0_joint_pos"}
+
+
+def test_metric_depth_rejects_and_describes_invalid_frames() -> None:
+    sim = SimpleNamespace(model=SimpleNamespace(
+        stat=SimpleNamespace(extent=1.0),
+        vis=SimpleNamespace(map=SimpleNamespace(znear=0.1, zfar=10.0)),
+    ))
+    for frame, counts in (
+        (np.array([[0.0, 1.0 + 1e-7]], dtype=np.float32), (0, 1, 0)),
+        (np.array([[-0.01, np.nan]], dtype=np.float32), (1, 0, 1)),
+    ):
+        try:
+            RobosuiteBackend._metric_depth(sim, frame)
+        except ValueError as exc:
+            details = json.loads(str(exc).split(": ", 1)[1])
+            assert (details["below_zero_count"], details["above_one_count"],
+                    details["nonfinite_count"]) == counts
+            assert details["shape"] == [1, 2]
+            assert len(details["frame_sha256"]) == 64
+        else:
+            raise AssertionError("invalid depth frame was accepted")
+    assert np.isfinite(RobosuiteBackend._metric_depth(
+        sim, np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
+    )).all()
 
 
 def test_http_service_contract_round_trip() -> None:

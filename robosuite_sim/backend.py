@@ -230,8 +230,22 @@ class RobosuiteBackend:
         """Convert MuJoCo's normalized depth buffer to meters."""
 
         normalized = np.asarray(depth, dtype=np.float64)
-        if np.any(normalized < 0.0) or np.any(normalized > 1.0):
-            raise ValueError("normalized depth must lie in [0, 1]")
+        invalid = ~np.isfinite(normalized) | (normalized < 0.0) | (normalized > 1.0)
+        if np.any(invalid):
+            finite = normalized[np.isfinite(normalized)]
+            diagnostics = {
+                "shape": list(normalized.shape),
+                "source_dtype": str(np.asarray(depth).dtype),
+                "frame_sha256": hashlib.sha256(np.ascontiguousarray(depth).tobytes()).hexdigest(),
+                "finite_count": int(finite.size),
+                "nonfinite_count": int(normalized.size - finite.size),
+                "below_zero_count": int(np.count_nonzero(normalized < 0.0)),
+                "above_one_count": int(np.count_nonzero(normalized > 1.0)),
+                "finite_min": float(finite.min()) if finite.size else None,
+                "finite_max": float(finite.max()) if finite.size else None,
+                "first_invalid_index": list(map(int, np.argwhere(invalid)[0])),
+            }
+            raise ValueError("invalid normalized depth frame: " + json.dumps(diagnostics, sort_keys=True))
         extent = float(sim.model.stat.extent)
         far = float(sim.model.vis.map.zfar) * extent
         near = float(sim.model.vis.map.znear) * extent
