@@ -6,6 +6,7 @@ import importlib.metadata
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -233,10 +234,11 @@ class RobosuiteBackend:
         invalid = ~np.isfinite(normalized) | (normalized < 0.0) | (normalized > 1.0)
         if np.any(invalid):
             finite = normalized[np.isfinite(normalized)]
+            frame = np.ascontiguousarray(depth)
             diagnostics = {
                 "shape": list(normalized.shape),
                 "source_dtype": str(np.asarray(depth).dtype),
-                "frame_sha256": hashlib.sha256(np.ascontiguousarray(depth).tobytes()).hexdigest(),
+                "frame_sha256": hashlib.sha256(frame.tobytes()).hexdigest(),
                 "finite_count": int(finite.size),
                 "nonfinite_count": int(normalized.size - finite.size),
                 "below_zero_count": int(np.count_nonzero(normalized < 0.0)),
@@ -245,6 +247,29 @@ class RobosuiteBackend:
                 "finite_max": float(finite.max()) if finite.size else None,
                 "first_invalid_index": list(map(int, np.argwhere(invalid)[0])),
             }
+            first = normalized[tuple(diagnostics["first_invalid_index"])]
+            diagnostics["first_invalid_kind"] = (
+                "nan" if np.isnan(first) else
+                "positive_infinity" if np.isposinf(first) else
+                "negative_infinity" if np.isneginf(first) else
+                "below_zero" if first < 0.0 else "above_one"
+            )
+            capture_dir = os.environ.get("TIDYBOT_INVALID_DEPTH_DIR")
+            if capture_dir:
+                try:
+                    directory = Path(capture_dir).resolve()
+                    directory.mkdir(parents=True, exist_ok=True)
+                    target = directory / f"{diagnostics['frame_sha256']}.npy"
+                    with tempfile.NamedTemporaryFile(dir=directory, suffix=".npy", delete=False) as tmp:
+                        temporary = Path(tmp.name)
+                        np.save(tmp, frame, allow_pickle=False)
+                        tmp.flush()
+                        os.fsync(tmp.fileno())
+                    os.replace(temporary, target)
+                    diagnostics["capture_path"] = str(target)
+                    diagnostics["capture_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+                except Exception as exc:
+                    diagnostics["capture_error"] = f"{type(exc).__name__}: {exc}"
             raise ValueError("invalid normalized depth frame: " + json.dumps(diagnostics, sort_keys=True))
         extent = float(sim.model.stat.extent)
         far = float(sim.model.vis.map.zfar) * extent

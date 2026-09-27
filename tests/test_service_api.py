@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import json
+import hashlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -69,7 +70,8 @@ def test_public_filter_removes_object_oracle() -> None:
     assert set(public) == {"agentview_image", "robot0_joint_pos"}
 
 
-def test_metric_depth_rejects_and_describes_invalid_frames() -> None:
+def test_metric_depth_rejects_and_describes_invalid_frames(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TIDYBOT_INVALID_DEPTH_DIR", str(tmp_path))
     sim = SimpleNamespace(model=SimpleNamespace(
         stat=SimpleNamespace(extent=1.0),
         vis=SimpleNamespace(map=SimpleNamespace(znear=0.1, zfar=10.0)),
@@ -86,6 +88,12 @@ def test_metric_depth_rejects_and_describes_invalid_frames() -> None:
                     details["nonfinite_count"]) == counts
             assert details["shape"] == [1, 2]
             assert len(details["frame_sha256"]) == 64
+            captured = np.load(details["capture_path"], allow_pickle=False)
+            np.testing.assert_equal(captured, frame)
+            assert details["capture_sha256"] == hashlib.sha256(
+                tmp_path.joinpath(details["frame_sha256"] + ".npy").read_bytes()
+            ).hexdigest()
+            assert details["first_invalid_kind"] in {"above_one", "below_zero"}
         else:
             raise AssertionError("invalid depth frame was accepted")
     assert np.isfinite(RobosuiteBackend._metric_depth(
