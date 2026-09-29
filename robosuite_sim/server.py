@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import uuid
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -13,6 +16,13 @@ import numpy as np
 
 from .backend import BackendConfig, RobosuiteBackend
 from .codec import decode_array, encode_array, encode_observation
+from .journal import RequestJournal
+
+
+class StructuredServiceError(RuntimeError):
+    def __init__(self, payload, status=500):
+        self.payload, self.status = payload, status
+        super().__init__(payload["error"])
 
 
 BackendFactory = Callable[[BackendConfig], RobosuiteBackend]
@@ -21,13 +31,16 @@ BackendFactory = Callable[[BackendConfig], RobosuiteBackend]
 class SimulatorState:
     def __init__(
         self, backend_factory: BackendFactory = RobosuiteBackend,
-        *, enable_sim_gt: bool = False,
+        *, enable_sim_gt: bool = False, receipt_dir=None,
     ) -> None:
         self._backend_factory = backend_factory
         self.enable_sim_gt = enable_sim_gt
         self._backend: RobosuiteBackend | None = None
         self._config: BackendConfig | None = None
         self._lock = threading.RLock()
+        self.journal = RequestJournal(receipt_dir)
+        self._session_id = None
+        os.environ.setdefault("TIDYBOT_INVALID_DEPTH_DIR", str(self.journal.directory / "frames"))
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -49,6 +62,9 @@ class SimulatorState:
             "harness_operations": ["reset", "success", "reference", "close"],
             "sensors": ["rgb", "metric_depth", "camera_intrinsics", "camera_pose", "proprioception"],
             "object_oracle_visible": False,
+            "step_idempotency": "session_id + request_id; persist before response",
+            "action_receipt": "durable before observation conversion",
+            "depth_recovery": "one observation-only rerender; fail closed on inequivalence",
         }
 
     def reset(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -70,6 +86,7 @@ class SimulatorState:
                 self._close_unlocked()
                 self._backend = self._backend_factory(config)
                 self._config = config
+            self._session_id = uuid.uuid4().hex
             observation = self._backend.reset(seed)
             requested = request.get("variation")
             discovery = request.get("discover_variation") is True
@@ -83,7 +100,7 @@ class SimulatorState:
                 "observation": encode_observation(observation),
                 "action_low": encode_array(low),
                 "action_high": encode_array(high),
-                "metadata": self._backend.metadata,
+                "metadata": {**self._backend.metadata, "session_id": self._session_id},
             }
             if applied is not None:
                 result["applied_variation"] = applied
@@ -112,14 +129,75 @@ class SimulatorState:
 
     def step(self, request: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            session_id, request_id = request.get("session_id"), request.get("request_id")
+            if not all(isinstance(v, str) and 0 < len(v) <= 128 for v in (session_id, request_id)):
+                raise StructuredServiceError({"error": "session_id and request_id required",
+                                              "action_executed": False}, 400)
+            action = decode_array(request["action"])
+            action_sha = hashlib.sha256(json.dumps(encode_array(action), sort_keys=True).encode()).hexdigest()
+            existing = self.journal.read(session_id, request_id)
+            if existing is not None:
+                if existing["action_sha256"] != action_sha:
+                    raise StructuredServiceError({"error": "request_id reused with different action",
+                                                  "action_executed": False}, 409)
+                response = existing.get("response")
+                if response is None:
+                    raise StructuredServiceError({"error": "request outcome unresolved; will not execute again",
+                        "action_executed": existing.get("action_executed"),
+                        "receipt": existing.get("receipt"), "session_id": session_id,
+                        "request_id": request_id, "requires_reset": True}, 409)
+                if existing["http_status"] != 200:
+                    raise StructuredServiceError(response, existing["http_status"])
+                return response
+            if session_id != self._session_id:
+                raise StructuredServiceError({"error": "inactive session", "action_executed": False}, 409)
             backend = self._require_backend()
-            observation, reward, done, info = backend.step(decode_array(request["action"]))
-            return {
-                "observation": encode_observation(observation),
-                "reward": reward,
-                "done": done,
-                "info": info,
-            }
+            low, high = backend.action_spec
+            if action.shape != low.shape or not np.isfinite(action).all():
+                raise StructuredServiceError({"error": "invalid action", "action_executed": False}, 400)
+            record = {"session_id": session_id, "request_id": request_id,
+                      "action_sha256": action_sha, "action_executed": None, "phase": "intent"}
+            self.journal.write(record)  # Persist intent before calling physics.
+
+            def executed(entry):
+                record.update(action_executed=True, phase="executed", receipt=dict(entry))
+                self.journal.write(record)  # Reward/done/action durable before depth conversion.
+
+            backend._receipt_hook = executed
+            try:
+                observation, reward, done, info = backend.step(action)
+                if record["action_executed"] is not True:
+                    executed({"action": np.clip(action, low, high).tolist(), "reward": reward,
+                              "done": done, "action_executed": True})
+                response = {"observation": encode_observation(observation), "reward": reward,
+                            "done": done, "info": info, "action_executed": True,
+                            "receipt": record["receipt"], "session_id": session_id, "request_id": request_id}
+                record.update(phase="completed", response=response, http_status=200,
+                              backend_trace=list(backend.trace))
+                self.journal.write(record)
+                return response
+            except Exception as exc:
+                diagnostics = None
+                prefix = "invalid normalized depth frame: "
+                if str(exc).startswith(prefix):
+                    diagnostics = json.loads(str(exc)[len(prefix):])
+                stop = {"environment_closed": False, "reason": "action_or_observation_failure"}
+                try:
+                    backend.close()
+                    stop["environment_closed"] = True
+                except Exception as close_error:
+                    stop["close_error"] = str(close_error)
+                self._backend = None
+                self._config = None
+                response = {"error": f"{type(exc).__name__}: {exc}",
+                            "action_executed": record["action_executed"], "receipt": record.get("receipt"),
+                            "diagnostics": diagnostics, "stop": stop, "requires_reset": True,
+                            "backend_trace": list(backend.trace), "session_id": session_id, "request_id": request_id}
+                record.update(phase="stopped", response=response, http_status=500)
+                self.journal.write(record)
+                raise StructuredServiceError(response) from exc
+            finally:
+                backend._receipt_hook = None
 
     def observe(self) -> dict[str, Any]:
         with self._lock:
@@ -138,7 +216,7 @@ class SimulatorState:
                 "observation": encode_observation(backend.observe()),
                 "action_low": encode_array(low),
                 "action_high": encode_array(high),
-                "metadata": backend.metadata,
+                "metadata": {**backend.metadata, "session_id": self._session_id},
             }
 
     def success(self) -> dict[str, Any]:
@@ -223,6 +301,8 @@ def handler_factory(state: SimulatorState):
             try:
                 value = route(request) if request or self.command == "POST" else route()
                 self._send(200, value)
+            except StructuredServiceError as exc:
+                self._send(exc.status, exc.payload)
             except Exception as exc:
                 self._send(
                     500,

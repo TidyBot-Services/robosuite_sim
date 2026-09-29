@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tidybot-robosuite-sim"
-version = "1.0.0"
+version = "1.1.0"
 description = "Independent TidyBot Robosuite simulation service and HTTP client"
 readme = "README.md"
 requires-python = ">=3.10"

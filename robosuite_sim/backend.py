@@ -131,6 +131,13 @@ class RobosuiteBackend:
         applied_action = np.clip(array, low, high)
         raw, reward, done, info = self._env.step(applied_action)
         self._last_raw = raw
+        # Record the action result before any camera conversion or rerender.
+        entry = {"step": len(self.trace), "action": applied_action.tolist(),
+                 "reward": float(reward), "done": bool(done), "action_executed": True}
+        self.trace.append(entry)
+        hook = getattr(self, "_receipt_hook", None)
+        if hook is not None:
+            hook(entry)
         depth_recovery = None
         try:
             public = self._public_observation(raw, phase="step", action=applied_action)
@@ -139,7 +146,13 @@ class RobosuiteBackend:
             if not str(exc).startswith(prefix):
                 raise
             diagnostics = json.loads(str(exc)[len(prefix):])
-            repeat, repeat_raw = self._probe_depth_repeat()
+            try:
+                repeat, repeat_raw = self._probe_depth_repeat()
+            except Exception as probe_error:
+                repeat, repeat_raw = {"status": "probe_error", "observation_only": True,
+                    "simulation_time_unchanged": False, "qpos_unchanged": False,
+                    "error": f"{type(probe_error).__name__}: {probe_error}"}, None
+            entry["depth_recovery"] = diagnostics
             diagnostics["repeat_observation"] = repeat
             recoverable = (
                 repeat_raw is not None
@@ -148,25 +161,23 @@ class RobosuiteBackend:
                 and repeat.get("qpos_unchanged") is True
                 and "capture_sha256" in diagnostics
                 and "capture_sha256" in repeat
+                and repeat["intrinsics_before"] == repeat["intrinsics_after"]
+                and repeat["pose_before"] == repeat["pose_after"]
             )
             if not recoverable:
                 raise ValueError(prefix + json.dumps(diagnostics, sort_keys=True)) from exc
             try:
                 public = self._public_observation(
                     repeat_raw, phase="step_repeat", action=applied_action)
-            except Exception:
+                equivalence = self._recovery_equivalence(raw, repeat_raw, public)
+                diagnostics["equivalence"] = equivalence
+                if equivalence["passed"] is not True:
+                    raise ValueError("recovery observation is not equivalent")
+            except Exception as recovery_error:
+                diagnostics["recovery_error"] = f"{type(recovery_error).__name__}: {recovery_error}"
                 raise ValueError(prefix + json.dumps(diagnostics, sort_keys=True)) from exc
             self._last_raw = repeat_raw
             depth_recovery = diagnostics
-        self.trace.append(
-            {
-                "step": len(self.trace),
-                "action": applied_action.tolist(),
-                "reward": float(reward),
-                "done": bool(done),
-                **({"depth_recovery": depth_recovery} if depth_recovery is not None else {}),
-            }
-        )
         public_info = dict(info)
         if depth_recovery is not None:
             public_info["depth_recovered_without_physics_step"] = True
@@ -262,7 +273,7 @@ class RobosuiteBackend:
                 diagnostics = json.loads(str(exc)[len(prefix):])
                 diagnostics["observation_phase"] = phase
                 diagnostics["camera_name"] = camera
-                diagnostics["backend_step_index"] = len(self.trace)
+                diagnostics["backend_step_index"] = max(0, len(self.trace) - 1)
                 if action is not None:
                     diagnostics["action_sha256"] = hashlib.sha256(
                         np.ascontiguousarray(action).tobytes()).hexdigest()
@@ -289,6 +300,9 @@ class RobosuiteBackend:
         data = getattr(sim, "data", None)
         before_time = getattr(data, "time", None)
         before_qpos = np.asarray(data.qpos).copy() if hasattr(data, "qpos") else None
+        before_intrinsics = self._camera_intrinsics(sim, self.config.camera_name,
+            self.config.camera_height, self.config.camera_width)
+        before_pose = self._camera_pose(sim, self.config.camera_name)
         result: dict[str, Any] = {"observation_only": True}
         raw: Mapping[str, Any] | None = None
         try:
@@ -341,6 +355,15 @@ class RobosuiteBackend:
             result["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             after_time = getattr(data, "time", None)
+            result["simulation_time_before"] = before_time
+            result["simulation_time_after"] = after_time
+            result["qpos_before"] = before_qpos.tolist() if before_qpos is not None else None
+            result["qpos_after"] = np.asarray(data.qpos).tolist() if hasattr(data, "qpos") else None
+            result["intrinsics_before"] = before_intrinsics.tolist()
+            result["intrinsics_after"] = self._camera_intrinsics(sim, self.config.camera_name,
+                self.config.camera_height, self.config.camera_width).tolist()
+            result["pose_before"] = before_pose.tolist()
+            result["pose_after"] = self._camera_pose(sim, self.config.camera_name).tolist()
             result["simulation_time_unchanged"] = (
                 before_time is not None and before_time == after_time)
             if before_qpos is not None:
@@ -348,6 +371,40 @@ class RobosuiteBackend:
             else:
                 result["qpos_unchanged"] = False
         return result, raw
+
+    def _recovery_equivalence(self, original, repeated, public):
+        camera = self.config.camera_name
+        filtered = self._filter_observation(original)
+        expected_keys = set(filtered) | {f"{camera}_intrinsics", f"{camera}_pose_mat"}
+        checks = {"same_keys": set(public) == expected_keys,
+                  "same_dtype": True, "same_shape": True,
+                  "proprioception_unchanged": True}
+        for key, value in filtered.items():
+            expected_dtype = np.dtype("float32") if key.endswith("_depth") else value.dtype
+            checks["same_dtype"] &= key in public and public[key].dtype == expected_dtype
+            checks["same_shape"] &= key in public and public[key].shape == value.shape
+            if key.startswith("robot0_"):
+                checks["proprioception_unchanged"] &= key in public and np.array_equal(value, public[key])
+        depth = public[f"{camera}_depth"]
+        normalized = np.flipud(repeated[f"{camera}_depth"])
+        sim = self._env.sim
+        near = float(sim.model.vis.map.znear) * float(sim.model.stat.extent)
+        far = float(sim.model.vis.map.zfar) * float(sim.model.stat.extent)
+        expected = (near / (1 - np.asarray(normalized, dtype=np.float64) * (1 - near / far))).astype(np.float32)
+        checks["legal_metric_depth"] = bool(np.isfinite(depth).all() and (depth > 0).all()
+            and np.array_equal(depth, expected))
+        # Capture complete public fields and source normalized depth for independent replay.
+        directory = Path(os.environ["TIDYBOT_INVALID_DEPTH_DIR"]).resolve()
+        with tempfile.NamedTemporaryFile(dir=directory, prefix="equivalence-", suffix=".npz", delete=False) as stream:
+            np.savez(stream, **{"original__" + k: v for k, v in filtered.items()},
+                     **{"public__" + k: v for k, v in public.items()}, normalized_depth=normalized,
+                     near=np.array(near), far=np.array(far))
+            stream.flush()
+            os.fsync(stream.fileno())
+            path = Path(stream.name)
+        return {"checks": {k: bool(v) for k, v in checks.items()},
+                "passed": all(checks.values()), "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
     @staticmethod
     def _metric_depth(sim: Any, depth: np.ndarray) -> np.ndarray:

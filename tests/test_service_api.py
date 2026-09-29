@@ -189,7 +189,8 @@ def test_depth_repeat_probe_preserves_failed_step_and_physics_state(
     assert np.load(repeat["capture_path"], allow_pickle=False).item() == pytest.approx(repeat_value)
     assert backend._env.action_calls == 1
     assert backend._env.observation_calls == 1
-    assert len(backend.trace) == (1 if expected == "valid" else 0)
+    assert len(backend.trace) == 1
+    assert backend.trace[0]["action_executed"] is True
 
 
 def test_http_service_contract_round_trip() -> None:
