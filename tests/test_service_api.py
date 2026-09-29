@@ -3,9 +3,11 @@ from __future__ import annotations
 import threading
 import json
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from robosuite_sim.backend import BackendConfig, RobosuiteBackend
 from robosuite_sim.client import RobosuiteSimClient
@@ -91,7 +93,7 @@ def test_metric_depth_rejects_and_describes_invalid_frames(tmp_path, monkeypatch
             captured = np.load(details["capture_path"], allow_pickle=False)
             np.testing.assert_equal(captured, frame)
             assert details["capture_sha256"] == hashlib.sha256(
-                tmp_path.joinpath(details["frame_sha256"] + ".npy").read_bytes()
+                Path(details["capture_path"]).read_bytes()
             ).hexdigest()
             assert details["first_invalid_kind"] in {"above_one", "below_zero"}
         else:
@@ -99,6 +101,95 @@ def test_metric_depth_rejects_and_describes_invalid_frames(tmp_path, monkeypatch
     assert np.isfinite(RobosuiteBackend._metric_depth(
         sim, np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
     )).all()
+
+
+def test_repeated_invalid_frames_keep_both_captures_and_action_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("TIDYBOT_INVALID_DEPTH_DIR", str(tmp_path))
+    backend = object.__new__(RobosuiteBackend)
+    backend.config = BackendConfig(task_id="cube_lift")
+    backend._env = SimpleNamespace(sim=object())
+    backend.trace = []
+    frame = np.array([[[1.0 + 1e-7]]], dtype=np.float32)
+    action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0])
+    paths = []
+    for _ in range(2):
+        with pytest.raises(ValueError, match="invalid normalized depth frame") as error:
+            backend._public_observation({"agentview_depth": frame},
+                                        phase="step", action=action)
+        details = json.loads(str(error.value).split(": ", 1)[1])
+        assert details["observation_phase"] == "step"
+        assert details["backend_step_index"] == 0
+        assert details["camera_name"] == "agentview"
+        assert details["action_sha256"] == hashlib.sha256(action.tobytes()).hexdigest()
+        paths.append(Path(details["capture_path"]))
+    assert paths[0] != paths[1]
+    assert all(path.exists() for path in paths)
+
+
+@pytest.mark.parametrize("repeat_value,expected", [(0.5, "valid"), (1.1, "invalid")])
+def test_depth_repeat_probe_preserves_failed_step_and_physics_state(
+    tmp_path, monkeypatch, repeat_value, expected,
+):
+    monkeypatch.setenv("TIDYBOT_INVALID_DEPTH_DIR", str(tmp_path))
+    sim = SimpleNamespace(
+        model=SimpleNamespace(
+            stat=SimpleNamespace(extent=1.0),
+            vis=SimpleNamespace(map=SimpleNamespace(znear=0.1, zfar=10.0)),
+            camera_name2id=lambda _name: 0,
+            cam_fovy=np.array([45.0]),
+        ),
+        data=SimpleNamespace(
+            time=0.0, qpos=np.array([0.0]),
+            cam_xmat=np.eye(3).reshape(1, 9), cam_xpos=np.zeros((1, 3)),
+        ),
+    )
+
+    class StepOnceEnvironment:
+        action_spec = (np.full(7, -1.0), np.full(7, 1.0))
+
+        def __init__(self):
+            self.sim = sim
+            self.action_calls = 0
+            self.observation_calls = 0
+
+        def step(self, _action):
+            self.action_calls += 1
+            self.sim.data.time += 0.1
+            self.sim.data.qpos[0] += 0.2
+            return {"agentview_depth": np.array([[[1.1]]], dtype=np.float32)}, 0.0, False, {}
+
+        def _get_observations(self, *, force_update):
+            assert force_update is True
+            self.observation_calls += 1
+            return {"agentview_depth": np.array([[[repeat_value]]], dtype=np.float32)}
+
+    backend = object.__new__(RobosuiteBackend)
+    backend.config = BackendConfig(task_id="cube_lift")
+    backend._env = StepOnceEnvironment()
+    backend._last_raw = None
+    backend.trace = []
+    action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0])
+    if expected == "valid":
+        public, _, _, info = backend.step(action)
+        assert np.isfinite(public["agentview_depth"]).all()
+        assert info["depth_recovered_without_physics_step"] is True
+        details = backend.trace[0]["depth_recovery"]
+        assert info["depth_recovery"]["first_frame_sha256"] == details["frame_sha256"]
+        assert (info["depth_recovery"]["repeat_frame_sha256"]
+                == details["repeat_observation"]["frame_sha256"])
+    else:
+        with pytest.raises(ValueError, match="invalid normalized depth frame") as error:
+            backend.step(action)
+        details = json.loads(str(error.value).split(": ", 1)[1])
+    repeat = details["repeat_observation"]
+    assert repeat["status"] == expected
+    assert repeat["simulation_time_unchanged"] is True
+    assert repeat["qpos_unchanged"] is True
+    assert repeat["observation_only"] is True
+    assert np.load(repeat["capture_path"], allow_pickle=False).item() == pytest.approx(repeat_value)
+    assert backend._env.action_calls == 1
+    assert backend._env.observation_calls == 1
+    assert len(backend.trace) == (1 if expected == "valid" else 0)
 
 
 def test_http_service_contract_round_trip() -> None:

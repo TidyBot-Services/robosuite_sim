@@ -119,7 +119,7 @@ class RobosuiteBackend:
         self._seed = seed
         self._last_raw = raw
         self.trace.clear()
-        return self._public_observation(raw)
+        return self._public_observation(raw, phase="reset")
 
     def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, dict[str, Any]]:
         low, high = self.action_spec
@@ -128,23 +128,66 @@ class RobosuiteBackend:
             raise ValueError(f"action shape {array.shape} does not match {low.shape}")
         if not np.isfinite(array).all():
             raise ValueError("action must contain only finite values")
-        raw, reward, done, info = self._env.step(np.clip(array, low, high))
+        applied_action = np.clip(array, low, high)
+        raw, reward, done, info = self._env.step(applied_action)
         self._last_raw = raw
-        public = self._public_observation(raw)
+        depth_recovery = None
+        try:
+            public = self._public_observation(raw, phase="step", action=applied_action)
+        except ValueError as exc:
+            prefix = "invalid normalized depth frame: "
+            if not str(exc).startswith(prefix):
+                raise
+            diagnostics = json.loads(str(exc)[len(prefix):])
+            repeat, repeat_raw = self._probe_depth_repeat()
+            diagnostics["repeat_observation"] = repeat
+            recoverable = (
+                repeat_raw is not None
+                and repeat.get("status") == "valid"
+                and repeat.get("simulation_time_unchanged") is True
+                and repeat.get("qpos_unchanged") is True
+                and "capture_sha256" in diagnostics
+                and "capture_sha256" in repeat
+            )
+            if not recoverable:
+                raise ValueError(prefix + json.dumps(diagnostics, sort_keys=True)) from exc
+            try:
+                public = self._public_observation(
+                    repeat_raw, phase="step_repeat", action=applied_action)
+            except Exception:
+                raise ValueError(prefix + json.dumps(diagnostics, sort_keys=True)) from exc
+            self._last_raw = repeat_raw
+            depth_recovery = diagnostics
         self.trace.append(
             {
                 "step": len(self.trace),
-                "action": np.clip(array, low, high).tolist(),
+                "action": applied_action.tolist(),
                 "reward": float(reward),
                 "done": bool(done),
+                **({"depth_recovery": depth_recovery} if depth_recovery is not None else {}),
             }
         )
-        return public, float(reward), bool(done), dict(info)
+        public_info = dict(info)
+        if depth_recovery is not None:
+            public_info["depth_recovered_without_physics_step"] = True
+            repeat = depth_recovery["repeat_observation"]
+            public_info["depth_recovery"] = {
+                "first_frame_sha256": depth_recovery["frame_sha256"],
+                "first_capture_sha256": depth_recovery["capture_sha256"],
+                "first_capture_file": Path(depth_recovery["capture_path"]).name,
+                "repeat_frame_sha256": repeat["frame_sha256"],
+                "repeat_capture_sha256": repeat["capture_sha256"],
+                "repeat_capture_file": Path(repeat["capture_path"]).name,
+                "simulation_time_unchanged": repeat["simulation_time_unchanged"],
+                "qpos_unchanged": repeat["qpos_unchanged"],
+                "observation_only": repeat["observation_only"],
+            }
+        return public, float(reward), bool(done), public_info
 
     def observe(self) -> dict[str, np.ndarray]:
         if self._last_raw is None:
             raise RuntimeError("reset must be called before observe")
-        return self._public_observation(self._last_raw)
+        return self._public_observation(self._last_raw, phase="observe")
 
     def native_success(self) -> bool:
         return bool(self._env._check_success())
@@ -191,7 +234,10 @@ class RobosuiteBackend:
     def close(self) -> None:
         self._env.close()
 
-    def _public_observation(self, raw: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    def _public_observation(
+        self, raw: Mapping[str, Any], *, phase: str = "observe",
+        action: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
         public = self._filter_observation(raw)
         if not self.config.camera:
             return public
@@ -207,10 +253,21 @@ class RobosuiteBackend:
         if image_key in public:
             public[image_key] = np.flipud(public[image_key]).copy()
         if depth_key in public:
-            public[depth_key] = np.asarray(
-                self._metric_depth(self._env.sim, np.flipud(public[depth_key])),
-                dtype=np.float32,
-            )
+            try:
+                metric_depth = self._metric_depth(self._env.sim, np.flipud(public[depth_key]))
+            except ValueError as exc:
+                prefix = "invalid normalized depth frame: "
+                if not str(exc).startswith(prefix):
+                    raise
+                diagnostics = json.loads(str(exc)[len(prefix):])
+                diagnostics["observation_phase"] = phase
+                diagnostics["camera_name"] = camera
+                diagnostics["backend_step_index"] = len(self.trace)
+                if action is not None:
+                    diagnostics["action_sha256"] = hashlib.sha256(
+                        np.ascontiguousarray(action).tobytes()).hexdigest()
+                raise ValueError(prefix + json.dumps(diagnostics, sort_keys=True)) from exc
+            public[depth_key] = np.asarray(metric_depth, dtype=np.float32)
         public[f"{camera}_intrinsics"] = np.asarray(
             self._camera_intrinsics(
                 self._env.sim,
@@ -225,6 +282,72 @@ class RobosuiteBackend:
             dtype=np.float64,
         )
         return public
+
+    def _probe_depth_repeat(self) -> tuple[dict[str, Any], Mapping[str, Any] | None]:
+        """Sample depth once more without a physics step after an invalid frame."""
+        sim = self._env.sim
+        data = getattr(sim, "data", None)
+        before_time = getattr(data, "time", None)
+        before_qpos = np.asarray(data.qpos).copy() if hasattr(data, "qpos") else None
+        result: dict[str, Any] = {"observation_only": True}
+        raw: Mapping[str, Any] | None = None
+        try:
+            raw = self._env._get_observations(force_update=True)
+            key = f"{self.config.camera_name}_depth"
+            if key not in raw:
+                result["status"] = "depth_missing"
+            else:
+                frame = np.ascontiguousarray(np.flipud(raw[key]))
+                normalized = np.asarray(frame, dtype=np.float64)
+                finite = normalized[np.isfinite(normalized)]
+                result.update({
+                    "frame_sha256": hashlib.sha256(frame.tobytes()).hexdigest(),
+                    "finite_min": float(finite.min()) if finite.size else None,
+                    "finite_max": float(finite.max()) if finite.size else None,
+                    "nonfinite_count": int(normalized.size - finite.size),
+                })
+                try:
+                    self._metric_depth(sim, frame)
+                except ValueError as exc:
+                    prefix = "invalid normalized depth frame: "
+                    if not str(exc).startswith(prefix):
+                        raise
+                    result["status"] = "invalid"
+                    result["invalid_diagnostics"] = json.loads(str(exc)[len(prefix):])
+                    for key in ("capture_path", "capture_sha256", "capture_error"):
+                        if key in result["invalid_diagnostics"]:
+                            result[key] = result["invalid_diagnostics"][key]
+                else:
+                    result["status"] = "valid"
+                capture_dir = os.environ.get("TIDYBOT_INVALID_DEPTH_DIR")
+                if capture_dir and "capture_path" not in result:
+                    try:
+                        directory = Path(capture_dir).resolve()
+                        directory.mkdir(parents=True, exist_ok=True)
+                        with tempfile.NamedTemporaryFile(
+                            dir=directory, prefix=f"repeat-{result['frame_sha256']}-",
+                            suffix=".npy", delete=False,
+                        ) as tmp:
+                            np.save(tmp, frame, allow_pickle=False)
+                            tmp.flush()
+                            os.fsync(tmp.fileno())
+                            target = Path(tmp.name)
+                        result["capture_path"] = str(target)
+                        result["capture_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+                    except Exception as exc:
+                        result["capture_error"] = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:
+            result["status"] = "probe_error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            after_time = getattr(data, "time", None)
+            result["simulation_time_unchanged"] = (
+                before_time is not None and before_time == after_time)
+            if before_qpos is not None:
+                result["qpos_unchanged"] = bool(np.array_equal(before_qpos, data.qpos))
+            else:
+                result["qpos_unchanged"] = False
+        return result, raw
 
     @staticmethod
     def _metric_depth(sim: Any, depth: np.ndarray) -> np.ndarray:
@@ -259,13 +382,14 @@ class RobosuiteBackend:
                 try:
                     directory = Path(capture_dir).resolve()
                     directory.mkdir(parents=True, exist_ok=True)
-                    target = directory / f"{diagnostics['frame_sha256']}.npy"
-                    with tempfile.NamedTemporaryFile(dir=directory, suffix=".npy", delete=False) as tmp:
-                        temporary = Path(tmp.name)
+                    with tempfile.NamedTemporaryFile(
+                        dir=directory, prefix=f"{diagnostics['frame_sha256']}-",
+                        suffix=".npy", delete=False,
+                    ) as tmp:
+                        target = Path(tmp.name)
                         np.save(tmp, frame, allow_pickle=False)
                         tmp.flush()
                         os.fsync(tmp.fileno())
-                    os.replace(temporary, target)
                     diagnostics["capture_path"] = str(target)
                     diagnostics["capture_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
                 except Exception as exc:
